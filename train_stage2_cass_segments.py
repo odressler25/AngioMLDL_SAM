@@ -299,7 +299,10 @@ class CASSDataset(Dataset):
         return len(self.cine_paths)
 
     def _compute_bbox_from_contours(self, contours_data, original_size):
-        """Compute normalized bounding box from Medis contours"""
+        """Compute normalized bounding box from Medis contours
+
+        Contours and masks are in the same coordinate space as the image.
+        """
         # Get all contour points
         all_points = []
         for key in ['centerline', 'left_edge', 'right_edge']:
