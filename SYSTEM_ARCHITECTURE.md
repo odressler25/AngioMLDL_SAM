@@ -1,193 +1,165 @@
 # SAM 3 Coronary Angiography System Architecture
 
-Last updated: 2025-11-24
+Last updated: 2025-11-25
+
+## IMPORTANT: Read PROJECT_PLAN_SAM3_NATIVE.md First
+
+**This document is now supplementary.** The main project plan is in `PROJECT_PLAN_SAM3_NATIVE.md`, which contains:
+- Complete project context and history
+- Data source locations and formats
+- SAM3 native training approach
+- Detailed implementation steps
+
+---
 
 ## Overview
 
-Fine-tuning SAM 3 (Segment Anything Model 3) for coronary angiography analysis. The system learns to segment vessels, classify CASS segments, and detect obstructions.
+Fine-tuning SAM 3 (Segment Anything Model 3) for coronary angiography analysis.
+
+**Key Discovery (Nov 25, 2025)**: We are using the REAL SAM 3 from Meta's paper "SAM 3: Segment Anything with Concepts". The repository includes official training code at `sam3/train/train.py`.
+
+## Git Branches
+
+| Branch | Purpose |
+|--------|---------|
+| `master` | Stable baseline |
+| `custom-training-backup` | Backup of custom training approach |
+| `sam3-native-training` | **Current** - SAM3 native training |
+
+## Training Approach Evolution
+
+### Previous: Custom Training (Backup)
+- Custom `train_stage1_deepsa.py` with manual SAM3 integration
+- CategoricalViewEncoder for view conditioning
+- Achieved Val Dice 0.80 at epoch 38/50
+
+### Current: SAM3 Native Training
+- Uses `sam3/train/train.py` with Hydra configs
+- Text prompts like "coronary artery", "proximal LAD"
+- Built-in hard negatives and presence token
+- COCO format dataset required
 
 ## 4-Phase Training Plan
 
 | Phase | Goal | Labels | Status |
 |-------|------|--------|--------|
-| 1 | Full vessel segmentation | DeepSA pseudo-labels | **Training** (Epoch 34, Val Dice 0.80) |
-| 2 | CASS segment classification | Medis contours (bboxes) | Ready |
-| 3 | Vessel obstruction detection | TBD | Pending |
-| 4 | Quantitative measurements | Medis GT masks | Ready (masks aligned correctly) |
+| 1 | Full vessel segmentation | DeepSA pseudo-labels | **Migrating to SAM3 native** |
+| 2 | CASS segment classification | Medis contours | Planned with text prompts |
+| 3 | View angle conditioning | - | Experiment design ready |
+| 4 | Quantitative measurements | Medis GT masks | Ready (masks confirmed aligned) |
 
-## Data Structure
+## Data Sources
 
-### CSV: `E:\AngioMLDL_data\corrected_dataset_training.csv`
+### Primary CSV
+**Path**: `E:\AngioMLDL_data\corrected_dataset_training.csv`
 
-| Column | Description |
-|--------|-------------|
-| `patient_id` | Patient identifier (e.g., 101-0025) |
-| `vessel_pattern` | Vessel location pattern (e.g., MID_LAD, PROX_RCA) |
-| `phase` | PRE, FINAL, or EVENT |
-| `vessel_name` | LAD, RCA, LCX, PDA, Ramus |
-| `cine_path` | Path to cine video (.npy, shape: [frames, H, W, 3]) |
-| `frame_index` | Which frame to use for analysis |
-| `contours_path` | Medis contours JSON (centerline, edges, view angles) |
-| `vessel_mask_actual_path` | Medis GT segment mask (correctly aligned) |
-| `deepsa_pseudo_label_path` | DeepSA full vessel mask (512x512, binary) |
-| `cass_segment` | CASS segment ID (corrected) |
-| `cass_segment_original` | Original CASS segment from data |
-| `split` | train/val |
+Key columns:
+- `frame_index` - Correct frame to extract from DICOM
+- `cass_segment` - Corrected CASS segment number
+- `deepsa_pseudo_label_path` - Path to DeepSA mask
+- `primary_angle`, `secondary_angle` - View angles in degrees
 
-### Dataset Statistics
-- Total samples: 748
-- Train: 521, Val: 227 (estimated)
-- Image resolution: 1016x1016
-- DeepSA masks: 512x512 (resized to match)
+### CASS Segments (Corrected)
 
-## CASS Segment Classification
-
-Standard CASS (Coronary Artery Surgery Study) numbering:
-
-### RCA and Branches (1-6)
-| ID | Name | Count |
-|----|------|-------|
+| ID | Segment | Count |
+|----|---------|-------|
 | 1 | Proximal RCA | 42 |
 | 2 | Mid RCA | 126 |
 | 3 | Distal RCA | 28 |
 | 4 | PDA | 38 |
-
-### LAD and Branches (11-17, 29)
-| ID | Name | Count |
-|----|------|-------|
 | 12 | Proximal LAD | 87 |
 | 13 | Mid LAD | 192 |
 | 14 | Distal LAD | 19 |
 | 15 | 1st Diagonal | 55 |
 | 16 | 2nd Diagonal | 13 |
-
-### LCX and Branches (18-27)
-| ID | Name | Count |
-|----|------|-------|
 | 18 | Proximal LCX | 26 |
-| 19 | Mid/Distal LCX | 65 |
+| 19 | Distal LCX | 65 |
 | 20 | OM1 | 29 |
 | 21 | OM2 | 14 |
-
-### Other
-| ID | Name | Count |
-|----|------|-------|
-| 28 | Ramus Intermedius | 14 |
+| 28 | Ramus | 14 |
 
 **Total: 14 classes, 748 samples**
 
-## Model Architecture
-
-### Phase 1: SAM3DeepSAModel
+## SAM3 Model Architecture
 
 ```
-SAM 3 Backbone (840M params, full fine-tuning)
-    |
-    v
-[Image Features] --> Feature Projection (if needed) --> 256 channels
-    |
-    +-- [View Angles] --> CategoricalViewEncoder --> 256-dim embedding
-    |                          |
-    v                          v
-    ViewConditionedFeatureFusion (FiLM)
-    |
-    v
-Segmentation Head --> 1-channel mask
+SAM3 (~850M parameters)
+├── Perception Encoder (PE) backbone
+│   ├── Vision encoder (~450M) - ViT-based
+│   └── Text encoder (~300M) - BERT-based
+├── DETR-style Detector
+│   ├── Transformer decoder
+│   ├── Presence token (critical for classification)
+│   └── Instance queries
+└── Segmentation Head
+    └── Mask decoder
 ```
 
-#### CategoricalViewEncoder
-- 9 bins per angle (-40 to +40 degrees, 10-degree intervals)
-- Separate embeddings for primary (RAO/LAO) and secondary (CRAN/CAUD)
-- Output: 256-dim view embedding
-- Note: View angles not yet utilized by model (same task regardless of angle)
+Key components:
+- **Presence token**: Distinguishes similar concepts (e.g., "proximal LAD" vs "mid LAD")
+- **Hard negatives**: Built-in support for improved classification
+- **Text prompting**: Segment based on natural language
 
-#### Training Config
-- Optimizer: AdamW
-- LR: 1e-4 (backbone 0.1x, heads 1x)
-- Batch size: 4 per GPU (effective 8)
-- Loss: 0.5 * BCE + 0.5 * Dice
-- Scheduler: Cosine annealing, 50 epochs
+## Hardware Configuration
 
-### Phase 2: SAM3CASSModel (extends Phase 1)
-
-```
-Phase 1 Model (loaded from checkpoint)
-    |
-    +-- Segmentation output (maintained)
-    |
-    +-- Global pooled features + View embedding
-            |
-            v
-        CASS Classifier --> 14 classes
-            |
-            v
-        BBox Regressor --> [x_center, y_center, w, h]
-```
-
-#### Training Config
-- Loss weights: 30% segmentation, 50% classification, 20% bbox
-- LR: 5e-5 (lower, fine-tuning)
-- This is where view angles become critical
-
-## Training Infrastructure
-
-### Hardware
-- 2x NVIDIA RTX 3090 (24GB each)
-- Target: ~20GB VRAM per GPU
-
-### DDP Configuration
-- Backend: gloo (Windows, NCCL not available)
-- `broadcast_buffers=False` (fixes gloo scalar type error)
-- Port: 12355 (Phase 1), 12356 (Phase 2)
+- **GPUs**: 2x NVIDIA RTX 3090 (24GB each)
+- **Target VRAM**: ~20GB per GPU
+- **Backend**: gloo (Windows) or NCCL (Linux)
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `train_stage1_deepsa.py` | Phase 1 training script |
-| `train_stage2_cass_segments.py` | Phase 2 training script |
-| `test_model_during_training.py` | Visualize predictions while training |
-| `test_view_angle_impact.py` | Test if model uses view angles |
-| `inspect_deepsa_labels.py` | Compare DeepSA vs Medis labels |
+| `PROJECT_PLAN_SAM3_NATIVE.md` | **Main project plan** |
+| `train_stage1_deepsa.py` | Custom Phase 1 (backup) |
+| `train_stage2_cass_segments.py` | Custom Phase 2 (backup) |
+| `checkpoints/phase1_deepsa_best.pth` | Best custom training checkpoint |
 
-## Checkpoints
+## SAM3 Repository
 
-| Checkpoint | Description |
-|------------|-------------|
-| `checkpoints/phase1_deepsa_best.pth` | Best Phase 1 model |
-| `checkpoints/phase1_deepsa_latest.pth` | Latest Phase 1 model |
-| `checkpoints/phase2_cass_best.pth` | Best Phase 2 model (future) |
+**Location**: `C:\Users\odressler\sam3`
 
-## Known Issues
+Key paths:
+- `sam3/train/train.py` - Main training script
+- `sam3/train/configs/` - Example Hydra configs
+- `assets/bpe_simple_vocab_16e6.txt.gz` - BPE tokenizer
 
-### 1. Medis GT Mask Alignment
-- Medis GT masks appear misaligned with input images
-- Possibly magnification/panning issue during annotation
-- **Blocked**: Phase 4 training until resolved
-- Model predictions actually align better with vessels than GT
+## Next Steps
 
-### 2. View Angles Not Utilized in Phase 1
-- Embeddings are different for different angles (avg similarity 0.62)
-- But predictions don't change with angle (variance 0.00024)
-- Expected: Phase 1 task doesn't require angle information
-- Phase 2 (CASS classification) will force model to use angles
-
-### 3. Student-Teacher Limitation
-- Training on DeepSA pseudo-labels limits performance to DeepSA quality
-- To surpass: need corrected labels or leverage additional info (temporal, multi-view)
+See `PROJECT_PLAN_SAM3_NATIVE.md` Section 9 for prioritized implementation steps.
 
 ## Training History
 
-### Phase 1: Full Vessel Segmentation
+### Custom Training (Backup Branch)
+| Date | Epoch | Train Dice | Val Dice |
+|------|-------|------------|----------|
+| 2025-11-24 | 38 | 0.84 | 0.80 |
 
-| Date | Epoch | Train Dice | Val Dice | Notes |
-|------|-------|------------|----------|-------|
-| 2025-11-24 | 4 | 0.67 | 0.66 | Initial progress |
-| 2025-11-24 | 6 | 0.71 | 0.70 | Steady improvement |
-| 2025-11-24 | 9 | 0.74 | 0.72 | Current best |
+### SAM3 Native Training
+| Date | Phase | Metric | Notes |
+|------|-------|--------|-------|
+| TBD | 1 | - | Migration in progress |
+
+## Resolved Issues
+
+### 1. Medis GT Mask Alignment - RESOLVED
+- **Was**: Thought masks misaligned, Phase 4 blocked
+- **Resolution**: Masks are correctly aligned; no scaling needed
+- **Status**: Phase 4 ready
+
+### 2. View Angles Not Used in Phase 1 - EXPECTED
+- Phase 1 (segmentation) doesn't require view angles
+- Phase 2 (CASS classification) will leverage them
+- SAM3 text prompts may naturally handle this
+
+### 3. SAM3 Training Infrastructure - AVAILABLE
+- **Was**: Assumed only inference code released
+- **Resolution**: Full training code at `sam3/train/train.py`
+- **Status**: Migrating to native training
 
 ## References
 
-- MedSAM2: Full fine-tuning approach, 12 H100s with DDP
-- SAM 3: 840M params, RoPE position encoding
-- CASS: Coronary Artery Surgery Study segment numbering (1-29)
+- SAM 3 Paper: "SAM 3: Segment Anything with Concepts" (Meta, 2025)
+- SAM 3 GitHub: https://github.com/facebookresearch/sam3
+- MedSAM2: Reference for medical imaging fine-tuning
+- CASS: Coronary Artery Surgery Study segment numbering
