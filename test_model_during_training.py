@@ -12,19 +12,30 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import json
 
-# Import model
-from train_stage1_with_ddp import SAM3FineTuneModel, AngiographyDataset
+# Import model - try new DeepSA model first, fallback to old
+try:
+    from train_stage1_deepsa import SAM3DeepSAModel, DeepSADataset
+    USE_DEEPSA = True
+except ImportError:
+    from train_stage1_with_ddp import SAM3FineTuneModel, AngiographyDataset
+    USE_DEEPSA = False
 
 
 def load_checkpoint(checkpoint_path, device='cpu'):
     """Load model from checkpoint"""
     print(f"Loading checkpoint from {checkpoint_path}...")
 
-    # Build model
-    model = SAM3FineTuneModel(
-        image_size=1008,
-        freeze_backbone=False  # Match training config
-    )
+    # Build model based on which training script we're using
+    if USE_DEEPSA:
+        model = SAM3DeepSAModel(
+            image_size=1008,
+            freeze_backbone=False
+        )
+    else:
+        model = SAM3FineTuneModel(
+            image_size=1008,
+            freeze_backbone=False
+        )
 
     # Load weights
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -111,7 +122,7 @@ def main():
 
     parser = argparse.ArgumentParser(description='Test model during training')
     parser.add_argument('--checkpoint', type=str,
-                       default='checkpoints/stage1_ddp_full_ft_best.pth',
+                       default='checkpoints/phase1_deepsa_best.pth',
                        help='Path to checkpoint')
     parser.add_argument('--num-samples', type=int, default=5,
                        help='Number of samples to visualize')
@@ -137,11 +148,18 @@ def main():
 
     # Load validation dataset
     print("\nLoading validation dataset...")
-    val_dataset = AngiographyDataset(
-        csv_path=r'E:\AngioMLDL_data\corrected_dataset_training.csv',
-        split='val',
-        image_size=1008
-    )
+    if USE_DEEPSA:
+        val_dataset = DeepSADataset(
+            csv_path=r'E:\AngioMLDL_data\corrected_dataset_training.csv',
+            split='val',
+            image_size=1008
+        )
+    else:
+        val_dataset = AngiographyDataset(
+            csv_path=r'E:\AngioMLDL_data\corrected_dataset_training.csv',
+            split='val',
+            image_size=1008
+        )
 
     # Predict and visualize
     print(f"\nGenerating predictions on {args.num_samples} samples...")
