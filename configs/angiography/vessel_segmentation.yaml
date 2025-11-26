@@ -8,7 +8,7 @@ defaults:
 # ============================================================================
 
 paths:
-  angio_data_root: E:/AngioMLDL_data/coco_format
+  angio_data_root: E:/AngioMLDL_data/coco_format_v2
   experiment_log_dir: C:/Users/odressler/AngioMLDL_SAM/experiments/phase1_vessel_seg
   bpe_path: C:/Users/odressler/sam3/assets/bpe_simple_vocab_16e6.txt.gz
 
@@ -55,6 +55,7 @@ angio_train:
   val_transforms:
     - _target_: sam3.train.transforms.basic_for_api.ComposeAPI
       transforms:
+        - _target_: sam3.train.transforms.segmentation.DecodeRle
         - _target_: sam3.train.transforms.basic_for_api.RandomResizeAPI
           sizes: ${scratch.resolution}
           max_size:
@@ -100,7 +101,17 @@ angio_train:
         weight_dict:
           loss_mask: 5.0
           loss_dice: 5.0
-    loss_fn_semantic_seg: null
+    # Semantic segmentation loss - provides negative supervision (background vs vessel)
+    loss_fn_semantic_seg:
+      _target_: sam3.train.loss.loss_fns.SemanticSegCriterion
+      weight_dict:
+        loss_semantic_seg: 5.0
+      focal: true
+      focal_alpha: 0.6
+      focal_gamma: 1.6
+      downsample: true
+      presence_head: false
+      presence_loss: true
     scale_by_find_batch_size: ${scratch.scale_by_find_batch_size}
 
 
@@ -201,8 +212,11 @@ scratch:
   original_box_postprocessor:
     _target_: sam3.eval.postprocessors.PostProcessImage
     max_dets_per_img: -1
+    iou_type: segm  # CRITICAL: Must be segm for segmentation evaluation
     use_original_ids: true
     use_original_sizes_box: true
+    use_original_sizes_mask: true
+    convert_mask_to_rle: true  # Convert masks to RLE for COCO eval
     use_presence: ${scratch.use_presence_eval}
 
   # Matcher configuration
@@ -240,7 +254,8 @@ scratch:
   gather_pred_via_filesys: false
 
   # Learning rate and scheduler parameters
-  lr_scale: 0.1
+  # Reduced from 0.1 to 0.02 to prevent NaN - small dataset needs conservative LR
+  lr_scale: 0.02
   lr_transformer: ${times:8e-4,${scratch.lr_scale}}
   lr_vision_backbone: ${times:2.5e-4,${scratch.lr_scale}}
   lr_language_backbone: ${times:5e-5,${scratch.lr_scale}}
@@ -269,6 +284,7 @@ trainer:
     backend: gloo  # Use gloo for Windows (NCCL not available)
     find_unused_parameters: True
     gradient_as_bucket_view: True
+    static_graph: True  # Enables optimization for consistent unused params (semantic_seg_head)
 
   loss:
     all: ${angio_train.loss}
@@ -294,6 +310,7 @@ trainer:
         coco_json_loader:
           _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
           prompts: null  # Use category names from JSON
+          include_negatives: true  # Include negative samples for background learning
           _partial_: true
       shuffle: True
       batch_size: ${scratch.train_batch_size}
@@ -315,7 +332,7 @@ trainer:
         coco_json_loader:
           _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
           prompts: null
-          include_negatives: false
+          include_negatives: true  # Include negative samples for proper evaluation
           _partial_: true
         img_folder: ${paths.angio_data_root}/val/images
         ann_file: ${paths.angio_data_root}/val/annotations.json
@@ -363,7 +380,7 @@ trainer:
   optim:
     amp:
       enabled: True
-      amp_dtype: bfloat16
+      amp_dtype: float16  # Changed from bfloat16 - gloo backend on Windows doesn't support bfloat16
 
     optimizer:
       _target_: torch.optim.AdamW
@@ -421,6 +438,12 @@ trainer:
   checkpoint:
     save_dir: ${launcher.experiment_log_dir}/checkpoints
     save_freq: 10  # Save every 10 epochs
+    # Resume from epoch 20 checkpoint (stable, before NaN crash at epoch 26)
+    resume_from: null  # Start fresh
+    # Save best model based on validation AP
+    save_best_meters:
+      - val_angio/detection/coco_eval_segm_AP  # Best overall segmentation AP
+      - val_angio/detection/coco_eval_segm_AP_50  # Best AP at IoU 0.5
 
   logging:
     tensorboard_writer:
@@ -430,7 +453,7 @@ trainer:
       should_log: True
     wandb_writer: null
     log_dir: ${launcher.experiment_log_dir}/logs
-    log_freq: 10
+    log_freq: 50  # Log every 50 batches (less verbose)
 
 
 # ============================================================================
@@ -450,5 +473,5 @@ submitit:
   timeout_hour: 72
   use_cluster: False  # Local training
   cpus_per_task: 8
-  port_range: [10000, 65000]
+  port_range: [29500, 29600]  # Narrow range to avoid Windows reserved ports
   constraint: null
