@@ -87,12 +87,21 @@ def convert_custom_to_native(input_path: str, output_path: str):
     if len(custom_head_keys) > 5:
         print(f"  ... and {len(custom_head_keys) - 5} more")
 
-    # Save in native format
-    # The native trainer expects either:
-    # 1. A state_dict directly
-    # 2. A checkpoint with 'model' key
+    # Save in native format - include dummy optimizer/scheduler to satisfy resume logic
+    # The native trainer expects 'model', 'optimizer', 'scheduler', 'epoch' keys
     native_checkpoint = {
         'model': native_state_dict,
+        'optimizer': {
+            'state': {},
+            'param_groups': []  # Empty param groups - trainer will reinitialize
+        },
+        'scheduler': {
+            'base_values': [],
+            'last_epoch': -1,
+            '_step_count': 0,
+            '_last_lr': []
+        },
+        'epoch': 0,       # Start from epoch 0
         'source': 'weight_surgery',
         'original_checkpoint': str(input_path),
         'original_epoch': epoch,

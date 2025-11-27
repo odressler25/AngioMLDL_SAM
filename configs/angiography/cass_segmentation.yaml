@@ -245,7 +245,7 @@ scratch:
   scale_by_find_batch_size: True
 
   # Image processing parameters
-  resolution: 1008
+  resolution: 672
   consistent_transform: False
   max_ann_per_img: 200
 
@@ -256,9 +256,9 @@ scratch:
   val_norm_std: [0.5, 0.5, 0.5]
 
   # Training parameters - optimized for 2x RTX 3090
-  train_batch_size: 2
+  train_batch_size: 1
   val_batch_size: 1
-  num_train_workers: 4
+  num_train_workers: 2
   num_val_workers: 2
   max_data_epochs: 50
   target_epoch_size: 521
@@ -371,6 +371,7 @@ trainer:
     device: cpu
     eval_mode: false
     enable_segmentation: ${scratch.enable_segmentation}
+    
 
   meters:
     val:
@@ -451,8 +452,9 @@ trainer:
   checkpoint:
     save_dir: ${launcher.experiment_log_dir}/checkpoints
     save_freq: 10
-    # CRITICAL: Initialize from Phase 1 domain-adapted checkpoint
-    resume_from: C:/Users/odressler/AngioMLDL_SAM/checkpoints/phase1_native_format.pth
+    # Phase 1 weights loaded separately (not via resume_from)
+    resume_from: null
+    init_weights_from: C:/Users/odressler/AngioMLDL_SAM/checkpoints/phase1_native_format.pth
     save_best_meters:
       - val_angio/detection/coco_eval_segm_AP
       - val_angio/detection/coco_eval_segm_AP_50
