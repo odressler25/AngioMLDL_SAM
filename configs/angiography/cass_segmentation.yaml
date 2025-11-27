@@ -3,18 +3,30 @@ defaults:
   - _self_
 
 # ============================================================================
-# Coronary Angiography Vessel Segmentation Training Config
-# Based on ODinW13 config but with segmentation enabled
+# Stage 2: CASS Segment Classification via SAM3 Native Training
+# ============================================================================
+#
+# Key differences from Phase 1 (DeepSA full vessel):
+# - 14 CASS segment categories (not 1 generic "coronary artery")
+# - Medis GT masks (discrete segments, not connected blobs)
+# - Initialized from Phase 1 checkpoint (domain-adapted backbone)
+# - Text prompts like "proximal_lad", "mid_rca" etc.
+#
+# This should work well because:
+# - Medis masks are discrete objects (not giant blobs)
+# - SAM3's instance head expects individual objects
+# - Presence token helps with multi-class detection
 # ============================================================================
 
 paths:
-  angio_data_root: E:/AngioMLDL_data/coco_format_v2
-  experiment_log_dir: C:/Users/odressler/AngioMLDL_SAM/experiments/phase1_vessel_seg
+  # New COCO dataset with CASS segment categories
+  angio_data_root: E:/AngioMLDL_data/coco_cass_segments
+  experiment_log_dir: C:/Users/odressler/AngioMLDL_SAM/experiments/stage2_cass_native
   bpe_path: C:/Users/odressler/sam3/assets/bpe_simple_vocab_16e6.txt.gz
 
 
 angio_train:
-  # Training transforms pipeline
+  # Training transforms pipeline - NO point prompts, using text prompts
   train_transforms:
     - _target_: sam3.train.transforms.basic_for_api.ComposeAPI
       transforms:
@@ -37,14 +49,6 @@ angio_train:
           size: ${scratch.resolution}
           consistent_transform: ${scratch.consistent_transform}
         - _target_: sam3.train.transforms.basic_for_api.ToTensorAPI
-        # Point prompts for better mask precision (bypasses text encoder)
-        - _target_: sam3.train.transforms.point_sampling.RandomGeometricInputsAPI
-          num_points: [5, 15]           # Sample 5-15 points per vessel
-          box_chance: 0.2               # 20% include box prompt
-          point_sample_mode: "centered" # Distance transform - finds centerline points
-          box_noise_std: 0.1            # Noise for robustness
-          geometric_query_str: "visual" # Bypass text encoder
-          resample_box_from_mask: true  # Compute box from mask
         - _target_: sam3.train.transforms.filter_query_transforms.FlexibleFilterFindGetQueries
           query_filter:
             _target_: sam3.train.transforms.filter_query_transforms.FilterEmptyTargets
@@ -76,7 +80,7 @@ angio_train:
           mean: ${scratch.val_norm_mean}
           std: ${scratch.val_norm_std}
 
-  # Loss config WITH mask loss for segmentation
+  # Loss config - optimized for multi-class instance segmentation
   loss:
     _target_: sam3.train.loss.sam3_loss.Sam3LossWrapper
     matcher: ${scratch.matcher}
@@ -104,12 +108,12 @@ angio_train:
         pos_focal: ${scratch.iabce_pos_focal}
         pad_n_queries: ${scratch.num_queries}
         pad_scale_pos: ${scratch.instance_query_loss_pad_scale_pos}
-      # CRITICAL: Mask loss for segmentation
+      # Mask loss for segmentation
       - _target_: sam3.train.loss.loss_fns.Masks
         weight_dict:
           loss_mask: 5.0
           loss_dice: 5.0
-    # Semantic segmentation loss - provides negative supervision (background vs vessel)
+    # Semantic segmentation loss (still useful for pixel-level supervision)
     loss_fn_semantic_seg:
       _target_: sam3.train.loss.loss_fns.SemanticSegCriterion
       weight_dict:
@@ -127,7 +131,7 @@ angio_train:
 # Model and Training Parameters
 # ============================================================================
 scratch:
-  # CRITICAL: Enable segmentation
+  # Enable segmentation
   enable_segmentation: True
 
   use_act_checkpoint_geo_encoder: True
@@ -183,6 +187,7 @@ scratch:
     _target_: sam3.model.tokenizer_ve.SimpleTokenizer
     bpe_path: ${paths.bpe_path}
 
+  # Keep backbone unfrozen for domain adaptation
   freeze_text_tower: False
   freeze_image_tower: NoFreeze
   vis_backbone_dp: 0.0
@@ -220,11 +225,11 @@ scratch:
   original_box_postprocessor:
     _target_: sam3.eval.postprocessors.PostProcessImage
     max_dets_per_img: -1
-    iou_type: segm  # CRITICAL: Must be segm for segmentation evaluation
+    iou_type: segm
     use_original_ids: true
     use_original_sizes_box: true
     use_original_sizes_mask: true
-    convert_mask_to_rle: true  # Convert masks to RLE for COCO eval
+    convert_mask_to_rle: true
     use_presence: ${scratch.use_presence_eval}
 
   # Matcher configuration
@@ -251,26 +256,26 @@ scratch:
   val_norm_std: [0.5, 0.5, 0.5]
 
   # Training parameters - optimized for 2x RTX 3090
-  train_batch_size: 2  # Per GPU, effective batch size = 4
+  train_batch_size: 2
   val_batch_size: 1
   num_train_workers: 4
   num_val_workers: 2
   max_data_epochs: 50
-  target_epoch_size: 521  # All training samples
+  target_epoch_size: 521
   hybrid_repeats: 1
   context_length: 2
   gather_pred_via_filesys: false
 
-  # Learning rate and scheduler parameters
-  # Reduced from 0.1 to 0.02 to prevent NaN - small dataset needs conservative LR
-  lr_scale: 0.02
+  # Learning rate - LOWER for fine-tuning from Phase 1
+  # The backbone already knows angiograms, just needs to learn segment names
+  lr_scale: 0.01  # Half of Phase 1 LR
   lr_transformer: ${times:8e-4,${scratch.lr_scale}}
   lr_vision_backbone: ${times:2.5e-4,${scratch.lr_scale}}
   lr_language_backbone: ${times:5e-5,${scratch.lr_scale}}
   lrd_vision_backbone: 0.9
   wd: 0.1
   scheduler_timescale: 20
-  scheduler_warmup: 20
+  scheduler_warmup: 10  # Shorter warmup since we're fine-tuning
   scheduler_cooldown: 20
 
 
@@ -280,7 +285,7 @@ scratch:
 
 trainer:
   _target_: sam3.train.trainer.Trainer
-  skip_saving_ckpts: false  # Save checkpoints
+  skip_saving_ckpts: false
   empty_gpu_mem_cache_after_eval: True
   skip_first_val: False
   max_epochs: ${scratch.max_data_epochs}
@@ -289,10 +294,10 @@ trainer:
   val_epoch_freq: 5
 
   distributed:
-    backend: gloo  # Use gloo for Windows (NCCL not available)
+    backend: gloo
     find_unused_parameters: True
     gradient_as_bucket_view: True
-    static_graph: True  # Enables optimization for consistent unused params (semantic_seg_head)
+    static_graph: True
 
   loss:
     all: ${angio_train.loss}
@@ -317,8 +322,8 @@ trainer:
         ann_file: ${paths.angio_data_root}/train/annotations.json
         coco_json_loader:
           _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
-          prompts: null  # Use category names from JSON
-          include_negatives: true  # Include negative samples for background learning
+          prompts: null  # Use category names from JSON (proximal_lad, mid_rca, etc.)
+          include_negatives: true  # Critical for multi-class: sample negative categories
           _partial_: true
       shuffle: True
       batch_size: ${scratch.train_batch_size}
@@ -340,7 +345,7 @@ trainer:
         coco_json_loader:
           _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
           prompts: null
-          include_negatives: true  # Include negative samples for proper evaluation
+          include_negatives: true
           _partial_: true
         img_folder: ${paths.angio_data_root}/val/images
         ann_file: ${paths.angio_data_root}/val/annotations.json
@@ -363,7 +368,7 @@ trainer:
   model:
     _target_: sam3.model_builder.build_sam3_image_model
     bpe_path: ${paths.bpe_path}
-    device: cpu  # Will be moved to GPU during training
+    device: cpu
     eval_mode: false
     enable_segmentation: ${scratch.enable_segmentation}
 
@@ -372,7 +377,7 @@ trainer:
       angio:
         detection:
           _target_: sam3.eval.coco_writer.PredictionDumper
-          iou_type: "segm"  # Use segmentation IoU
+          iou_type: "segm"
           dump_dir: ${launcher.experiment_log_dir}/dumps/angio
           merge_predictions: True
           postprocessor: ${scratch.original_box_postprocessor}
@@ -388,7 +393,7 @@ trainer:
   optim:
     amp:
       enabled: True
-      amp_dtype: float16  # Changed from bfloat16 - gloo backend on Windows doesn't support bfloat16
+      amp_dtype: float16
 
     optimizer:
       _target_: torch.optim.AdamW
@@ -445,13 +450,13 @@ trainer:
 
   checkpoint:
     save_dir: ${launcher.experiment_log_dir}/checkpoints
-    save_freq: 10  # Save every 10 epochs
-    # Resume from epoch 20 checkpoint (stable, before NaN crash at epoch 26)
-    resume_from: null  # Start fresh
-    # Save best model based on validation AP
+    save_freq: 10
+    # CRITICAL: Initialize from Phase 1 domain-adapted checkpoint
+    resume_from: C:/Users/odressler/AngioMLDL_SAM/checkpoints/phase1_native_format.pth
     save_best_meters:
-      - val_angio/detection/coco_eval_segm_AP  # Best overall segmentation AP
-      - val_angio/detection/coco_eval_segm_AP_50  # Best AP at IoU 0.5
+      - val_angio/detection/coco_eval_segm_AP
+      - val_angio/detection/coco_eval_segm_AP_50
+      - val_angio/detection/coco_eval_segm_AP_75
 
   logging:
     tensorboard_writer:
@@ -461,7 +466,7 @@ trainer:
       should_log: True
     wandb_writer: null
     log_dir: ${launcher.experiment_log_dir}/logs
-    log_freq: 50  # Log every 50 batches (less verbose)
+    log_freq: 50
 
 
 # ============================================================================
@@ -470,16 +475,16 @@ trainer:
 
 launcher:
   num_nodes: 1
-  gpus_per_node: 2  # 2x RTX 3090
+  gpus_per_node: 2
   experiment_log_dir: ${paths.experiment_log_dir}
-  multiprocessing_context: spawn  # Required for Windows
+  multiprocessing_context: spawn
 
 submitit:
   account: null
   partition: null
   qos: null
   timeout_hour: 72
-  use_cluster: False  # Local training
+  use_cluster: False
   cpus_per_task: 8
-  port_range: [29500, 29600]  # Narrow range to avoid Windows reserved ports
+  port_range: [29500, 29600]
   constraint: null

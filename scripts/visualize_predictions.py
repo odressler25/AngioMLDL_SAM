@@ -9,6 +9,7 @@ Usage:
     python scripts/visualize_predictions.py --num-images 10
     python scripts/visualize_predictions.py --checkpoint path/to/checkpoint.pt
     python scripts/visualize_predictions.py --gt-only  # No model inference
+    python scripts/visualize_predictions.py --gt-only --show-points  # Show centerline points
 """
 
 import argparse
@@ -21,6 +22,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from PIL import Image
+from scipy import ndimage
 
 # Add sam3 to path
 sys.path.insert(0, "C:/Users/odressler/sam3")
@@ -54,6 +56,48 @@ def load_ground_truth(ann_file, image_id):
     with open(ann_file, 'r') as f:
         coco_data = json.load(f)
     return [ann for ann in coco_data['annotations'] if ann['image_id'] == image_id]
+
+
+def sample_centerline_points(mask, num_points=10):
+    """Sample points along vessel centerline using distance transform.
+
+    This replicates SAM3's 'centered' point sampling mode which finds
+    points farthest from mask edges (i.e., centerline points).
+    """
+    if mask.sum() == 0:
+        return []
+
+    # Distance transform - values are distance to nearest background pixel
+    dist_transform = ndimage.distance_transform_edt(mask)
+
+    # Get all foreground points sorted by distance (highest first = most centered)
+    fg_points = np.argwhere(mask > 0)  # (y, x) format
+    distances = dist_transform[fg_points[:, 0], fg_points[:, 1]]
+
+    # Sort by distance descending
+    sorted_indices = np.argsort(-distances)
+    fg_points = fg_points[sorted_indices]
+    distances = distances[sorted_indices]
+
+    # Sample points with some spacing to cover the vessel
+    sampled_points = []
+    min_spacing = max(5, mask.shape[0] // 50)  # Minimum pixels between points
+
+    for i, (y, x) in enumerate(fg_points):
+        if len(sampled_points) >= num_points:
+            break
+
+        # Check if far enough from existing points
+        too_close = False
+        for py, px in sampled_points:
+            if abs(y - py) + abs(x - px) < min_spacing:
+                too_close = True
+                break
+
+        if not too_close:
+            sampled_points.append((y, x))
+
+    return sampled_points
 
 
 def load_model_from_checkpoint(checkpoint_path, device='cuda'):
@@ -99,7 +143,7 @@ def load_model_from_checkpoint(checkpoint_path, device='cuda'):
     return model
 
 
-def visualize_with_gt_only(image_path, ann_file, output_dir, image_info):
+def visualize_with_gt_only(image_path, ann_file, output_dir, image_info, show_points=False, num_points=10):
     """Visualize just the ground truth for comparison."""
     image = Image.open(image_path).convert('RGB')
     image_np = np.array(image)
@@ -107,7 +151,8 @@ def visualize_with_gt_only(image_path, ann_file, output_dir, image_info):
 
     gt_annotations = load_ground_truth(ann_file, image_info['id'])
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+    n_cols = 3 if show_points else 2
+    fig, axes = plt.subplots(1, n_cols, figsize=(7 * n_cols, 7))
 
     axes[0].imshow(image_np)
     axes[0].set_title(f"Original: {image_info['file_name']}", fontsize=10)
@@ -115,6 +160,7 @@ def visualize_with_gt_only(image_path, ann_file, output_dir, image_info):
 
     gt_overlay = image_np.copy()
     gt_mask_combined = np.zeros((height, width), dtype=np.uint8)
+    all_points = []
 
     for ann in gt_annotations:
         bbox = ann['bbox']
@@ -127,6 +173,9 @@ def visualize_with_gt_only(image_path, ann_file, output_dir, image_info):
                 mask = decode_rle(seg, height, width)
                 if mask is not None:
                     gt_mask_combined = np.maximum(gt_mask_combined, mask)
+                    if show_points:
+                        points = sample_centerline_points(mask, num_points=num_points)
+                        all_points.extend(points)
 
     gt_colored = gt_overlay.copy().astype(np.float32)
     mask_overlay = np.zeros_like(gt_colored)
@@ -138,12 +187,32 @@ def visualize_with_gt_only(image_path, ann_file, output_dir, image_info):
     axes[1].set_title(f"Ground Truth: {len(gt_annotations)} vessel annotations", fontsize=10)
     axes[1].axis('off')
 
+    if show_points:
+        # Draw centerline points
+        points_overlay = image_np.copy()
+
+        # Draw mask faintly
+        mask_layer = np.zeros_like(points_overlay, dtype=np.float32)
+        mask_layer[gt_mask_combined > 0] = [0, 255, 0]
+        points_overlay = points_overlay.astype(np.float32) * 0.7 + mask_layer * 0.3
+        points_overlay = np.clip(points_overlay, 0, 255).astype(np.uint8)
+
+        # Draw points as red circles
+        for y, x in all_points:
+            cv2.circle(points_overlay, (int(x), int(y)), 5, (255, 0, 0), -1)
+            cv2.circle(points_overlay, (int(x), int(y)), 5, (255, 255, 255), 1)
+
+        axes[2].imshow(points_overlay)
+        axes[2].set_title(f"Centerline Points: {len(all_points)} points", fontsize=10)
+        axes[2].axis('off')
+
     plt.tight_layout()
-    output_path = output_dir / f"gt_{image_info['id']:04d}.png"
+    suffix = "_points" if show_points else ""
+    output_path = output_dir / f"gt_{image_info['id']:04d}{suffix}.png"
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
-    return str(output_path)
+    return str(output_path), len(all_points) if show_points else 0
 
 
 def visualize_with_predictions(image_path, ann_file, output_dir, image_info, processor, text_prompt="coronary artery"):
@@ -254,6 +323,10 @@ def main():
                         help='Dataset split to use')
     parser.add_argument('--gt-only', action='store_true',
                         help='Only show ground truth (no model inference)')
+    parser.add_argument('--show-points', action='store_true',
+                        help='Show centerline points (distance transform sampling)')
+    parser.add_argument('--num-points', type=int, default=10,
+                        help='Number of centerline points per vessel (default: 10)')
     parser.add_argument('--confidence', type=float, default=0.3,
                         help='Confidence threshold for predictions')
     parser.add_argument('--prompt', type=str, default='coronary artery',
@@ -290,7 +363,10 @@ def main():
     print()
 
     if args.gt_only:
-        print("Mode: Ground truth only")
+        mode_str = "Ground truth + centerline points" if args.show_points else "Ground truth only"
+        print(f"Mode: {mode_str}")
+        if args.show_points:
+            print(f"Points per vessel: {args.num_points}")
         print()
         for i, img_info in enumerate(selected_images):
             image_path = img_dir / img_info['file_name']
@@ -298,9 +374,15 @@ def main():
             if not image_path.exists():
                 print(f"  Warning: Image not found")
                 continue
-            output_path = visualize_with_gt_only(image_path, ann_file, output_dir, img_info)
+            output_path, n_points = visualize_with_gt_only(
+                image_path, ann_file, output_dir, img_info,
+                show_points=args.show_points, num_points=args.num_points
+            )
             gt_annotations = load_ground_truth(ann_file, img_info['id'])
-            print(f"  {len(gt_annotations)} vessels -> {output_path}")
+            if args.show_points:
+                print(f"  {len(gt_annotations)} vessels, {n_points} points -> {output_path}")
+            else:
+                print(f"  {len(gt_annotations)} vessels -> {output_path}")
     else:
         if args.checkpoint:
             checkpoint_path = Path(args.checkpoint)
