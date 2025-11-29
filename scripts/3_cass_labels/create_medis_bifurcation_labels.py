@@ -164,10 +164,15 @@ def measure_branches(skeleton, bifurcation, all_bifurcations, dist_transform, ma
 
 # ============================================================================
 
-# Paths
-TRAINING_CSV = Path("E:/AngioMLDL_data/corrected_dataset_training.csv")
-IMAGES_DIR = Path("E:/AngioMLDL_data/coco_format_v2")
-OUTPUT_DIR = Path("E:/AngioMLDL_data/coco_medis_bifurcation")
+# Default Paths (can be overridden via CLI)
+DEFAULT_TRAINING_CSV = Path("E:/AngioMLDL_data/corrected_dataset_training.csv")
+DEFAULT_IMAGES_DIR = Path("E:/AngioMLDL_data/coco_format_v2")
+DEFAULT_OUTPUT_DIR = Path("E:/AngioMLDL_data/coco_medis_bifurcation")
+
+# Global paths (set at runtime)
+TRAINING_CSV = DEFAULT_TRAINING_CSV
+IMAGES_DIR = DEFAULT_IMAGES_DIR
+OUTPUT_DIR = DEFAULT_OUTPUT_DIR
 
 # CASS Categories
 CASS_CATEGORIES = [
@@ -828,10 +833,39 @@ def create_dataset(split="train", max_images=None):
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Create CASS-labeled COCO dataset from Medis contours + DeepSA masks",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--split", type=str, default="train", choices=["train", "val", "all"])
-    parser.add_argument("--max", type=int, default=None)
+    parser.add_argument("--max", type=int, default=None, help="Max images to process")
+
+    # Configurable paths
+    parser.add_argument("--csv", type=str, default=None,
+                        help="Training CSV with image/contour paths (default: built-in)")
+    parser.add_argument("--images", type=str, default=None,
+                        help="Directory containing source images")
+    parser.add_argument("--contours", type=str, default=None,
+                        help="Directory containing Medis contour JSON files")
+    parser.add_argument("--masks", type=str, default=None,
+                        help="Directory containing DeepSA vessel masks")
+    parser.add_argument("--output", "-o", type=str, default=None,
+                        help="Output directory for COCO dataset")
+
     args = parser.parse_args()
+
+    # Override global paths if provided
+    if args.csv:
+        TRAINING_CSV = Path(args.csv)
+    if args.images:
+        IMAGES_DIR = Path(args.images)
+    if args.output:
+        OUTPUT_DIR = Path(args.output)
+
+    print(f"Configuration:")
+    print(f"  CSV:      {TRAINING_CSV}")
+    print(f"  Images:   {IMAGES_DIR}")
+    print(f"  Output:   {OUTPUT_DIR}")
 
     if args.split == "all":
         create_dataset("train", args.max)
