@@ -5,13 +5,21 @@ Handles:
 1. Loading Phase 1 weights (model only, no optimizer)
 2. Gloo backend float32 conversion
 3. Standard resolution (no RoPE hacks)
+4. Reduced logging verbosity
 """
 
 import os
 import sys
+import logging
 
 # Add sam3 to path
 sys.path.insert(0, r"C:\Users\odressler\sam3")
+
+# Reduce logging verbosity - only show WARNING and above for most loggers
+logging.getLogger().setLevel(logging.WARNING)
+logging.getLogger("sam3").setLevel(logging.WARNING)
+logging.getLogger("fvcore").setLevel(logging.WARNING)
+logging.getLogger("detectron2").setLevel(logging.WARNING)
 
 import torch
 import torch.multiprocessing as mp
@@ -114,6 +122,15 @@ def resize_rope_embeddings(model, target_resolution, patch_size=14):
 
 def worker_process(rank, world_size, main_port, cfg_dict, weights_path):
     """Worker process - runs in isolated subprocess via spawn."""
+    # Reduce logging verbosity in worker
+    import logging
+    logging.getLogger().setLevel(logging.WARNING)
+    logging.getLogger("sam3").setLevel(logging.WARNING)
+    logging.getLogger("fvcore").setLevel(logging.WARNING)
+    logging.getLogger("detectron2").setLevel(logging.WARNING)
+
+    if rank == 0:
+        print(f"[Worker {rank}] Worker started. PID: {os.getpid()}")
 
     # Convert dict back to OmegaConf
     cfg = OmegaConf.create(cfg_dict)
@@ -126,7 +143,10 @@ def worker_process(rank, world_size, main_port, cfg_dict, weights_path):
     os.environ["WORLD_SIZE"] = str(world_size)
 
     # Import and patch AFTER spawn (fresh process)
+    import sam3
     from sam3.train import trainer as trainer_module
+    if rank == 0:
+        print(f"[Rank 0] SAM3 trainer loaded")
 
     # Patch 1: Load weights after model creation
     _original_load_checkpoint = trainer_module.Trainer.load_checkpoint
@@ -139,27 +159,28 @@ def worker_process(rank, world_size, main_port, cfg_dict, weights_path):
 
         # If checkpoint.pt exists, use original loader (resuming)
         if ckpt_in_savedir and os.path.exists(ckpt_in_savedir):
-            print(f"[Worker {rank}] Resuming from {ckpt_in_savedir}")
+            if rank == 0:
+                print(f"Resuming from checkpoint: {ckpt_in_savedir}")
             result = _original_load_checkpoint(self)
             _maybe_resize_rope(self)
             return result
 
         # Otherwise, load Phase 1 weights if provided
         if weights_path and os.path.exists(weights_path):
-            print(f"[Worker {rank}] Loading Phase 1 weights: {weights_path}")
+            if rank == 0:
+                print(f"Loading Phase 1 weights: {weights_path}")
             checkpoint = torch.load(weights_path, map_location='cpu')
 
             if 'model' in checkpoint:
                 missing, unexpected = self.model.load_state_dict(checkpoint['model'], strict=False)
-                print(f"[Worker {rank}] Loaded {len(checkpoint['model'])} keys")
-                if len(missing) > 0:
-                    print(f"[Worker {rank}] Missing {len(missing)} keys (random init)")
-                if len(unexpected) > 0:
-                    print(f"[Worker {rank}] Unexpected {len(unexpected)} keys (ignored)")
+                if rank == 0:
+                    print(f"Loaded {len(checkpoint['model'])} weight keys ({len(missing)} missing, {len(unexpected)} unexpected)")
             else:
-                print(f"[Worker {rank}] WARNING: No 'model' key in checkpoint")
+                if rank == 0:
+                    print(f"WARNING: No 'model' key in checkpoint")
         else:
-            print(f"[Worker {rank}] No weights to load, starting from scratch")
+            if rank == 0:
+                print(f"No weights to load, starting from scratch")
 
         _maybe_resize_rope(self)
 
@@ -171,10 +192,9 @@ def worker_process(rank, world_size, main_port, cfg_dict, weights_path):
         if hasattr(self, 'model') and self.model is not None:
             bf16_params = sum(1 for p in self.model.parameters() if p.dtype == torch.bfloat16)
             if bf16_params > 0:
-                print(f"[Worker {rank}] Converting {bf16_params} bfloat16 params to float32 (gloo)")
+                if rank == 0:
+                    print(f"Converting {bf16_params} bfloat16 params to float32 (gloo)")
                 self.model = self.model.float()
-
-        # Call original DDP setup
         return _original_setup_ddp(self, distributed_conf, accelerator)
 
     def _maybe_resize_rope(self):
@@ -184,15 +204,23 @@ def worker_process(rank, world_size, main_port, cfg_dict, weights_path):
         if not hasattr(self, 'model') or self.model is None:
             return
         model_to_resize = self.model.module if hasattr(self.model, 'module') else self.model
-        print(f"[Worker {rank}] Regenerating RoPE for resolution {target_res}")
+        if rank == 0:
+            print(f"Regenerating RoPE for resolution {target_res}")
         resize_rope_embeddings(model_to_resize, target_res)
 
     # Apply patches
-
     trainer_module.Trainer.load_checkpoint = _patched_load_checkpoint
-
     trainer_module.Trainer._setup_ddp_distributed_training = _patched_setup_ddp
 
+    # Patch 4: Fix COCO Area Calculation (remove normalization)
+    from sam3.eval import coco_writer
+    try:
+        if os.getcwd() not in sys.path:
+            sys.path.append(os.getcwd())
+        from patch_coco_writer import prepare_for_coco_segmentation_patched
+        coco_writer.PredictionDumper.prepare_for_coco_segmentation = prepare_for_coco_segmentation_patched
+    except ImportError:
+        pass  # Not critical
 
     # Register resolvers and instantiate trainer
     register_omegaconf_resolvers()
@@ -242,22 +270,13 @@ if __name__ == "__main__":
     exp_dir = cfg.paths.experiment_log_dir
     os.makedirs(exp_dir, exist_ok=True)
 
-    with g_pathmgr.open(os.path.join(exp_dir, "config.yaml"), "w") as f:
+    with g_pathmgr.open(os.path.join(exp_dir, "config_resolved.yaml"), "w") as f:
         f.write(OmegaConf.to_yaml(cfg))
 
     print(f"Experiment dir: {exp_dir}")
     print(f"Resolution: {cfg.scratch.resolution}")
     print(f"Batch size: {cfg.scratch.train_batch_size}")
     print(f"GPUs: {args.num_gpus}")
-
-    # Clean up old checkpoints
-    ckpt_dir = os.path.join(exp_dir, "checkpoints")
-    if os.path.exists(ckpt_dir):
-        for f in os.listdir(ckpt_dir):
-            if f == "checkpoint.pt":
-                old_ckpt = os.path.join(ckpt_dir, f)
-                print(f"Removing old checkpoint: {old_ckpt}")
-                os.remove(old_ckpt)
 
     # Spawn workers
     import random
