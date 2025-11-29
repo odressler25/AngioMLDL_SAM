@@ -311,6 +311,45 @@ python scripts/visualize_medis_dino_labels.py --n 6
 
 ---
 
+## SAM3 Training Configuration (CRITICAL)
+
+The labeling algorithm produces correct COCO annotations, but SAM3 requires specific training configuration:
+
+### Required Transform: TextQueryToVisual
+
+SAM3's PCS (Prompt Conditioning System) **ignores point prompts** and only uses **box prompts**. You MUST use `TextQueryToVisual` transform:
+
+```yaml
+# In BOTH train_transforms AND val_transforms:
+- _target_: sam3.train.transforms.filter_query_transforms.TextQueryToVisual
+  probability: 1.0              # Convert ALL queries to visual
+  keep_text_queries: false      # Replace text with "visual"
+```
+
+**Why this matters:**
+- `RandomGeometricInputsAPI` sets `input_bbox` but NOT `input_bbox_label` (crashes collator)
+- SAM3 PCS ignores point prompts entirely - only box prompts work
+- `TextQueryToVisual` properly sets both `input_bbox` AND `input_bbox_label`
+
+### Required: include_negatives: false
+
+```yaml
+coco_json_loader:
+  _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
+  prompts: null
+  include_negatives: false  # MUST be false - negative queries have no targets
+```
+
+**Why:** With 15 categories but only 1-3 annotations per image, `include_negatives: true` creates 12-14 empty queries that crash the transform pipeline.
+
+### Training Results
+
+With correct configuration:
+- **Epoch 0:** AP=0.060, AP50=0.250
+- **Epoch 30:** AP=0.182, AP50=0.511
+
+---
+
 ## Version History
 
 | Version | Date | Changes |
@@ -322,3 +361,4 @@ python scripts/visualize_medis_dino_labels.py --n 6
 | 5.0 | - | Angle-constrained tracing with centerline direction |
 | 6.0 | Nov 2024 | Strict mode for proximal + view angle validation |
 | 7.0 | Nov 2024 | **Advisory bifurcation detection** - detects major bifurcations and tightens angle constraints at junctions to stay on main vessel. Not a hard stop. |
+| 7.1 | Nov 2024 | **Training config fix** - Must use `TextQueryToVisual` transform (not `RandomGeometricInputsAPI`). SAM3 PCS ignores point prompts. |
